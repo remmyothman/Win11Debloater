@@ -1,189 +1,126 @@
-# Windows10Debloater
+# Win11Debloater
 
-[![made-with-powershell](https://img.shields.io/badge/PowerShell-1f425f?logo=Powershell)](https://microsoft.com/PowerShell)
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
+Windows 11 debloater, ported from [Sycnex/Windows10Debloater](https://github.com/Sycnex/Windows10Debloater)
+(archived September 2023, Windows 10 era).
 
-Script/Utility/Application to debloat Windows 10, to remove Windows pre-installed unnecessary applications, stop some telemetry functions, stop Cortana from being used as your Search Index, disable unnecessary scheduled tasks, and more...
+Removes preinstalled consumer bloatware, disables telemetry and advertising
+surfaces, and turns off the Windows 11 extras: Copilot, widgets, Chat/Teams,
+Start menu recommendations and web search in Start.
 
-## Donate a cup of coffee
-<a href="https://www.buymeacoffee.com/HZNh7w1Bm" target="_blank"><img src="https://www.buymeacoffee.com/assets/img/custom_images/orange_img.png" alt="Buy Me A Coffee" style="height: 41px !important;width: 174px !important;box-shadow: 0px 3px 2px 0px rgba(190, 190, 190, 0.5) !important;-webkit-box-shadow: 0px 3px 2px 0px rgba(190, 190, 190, 0.5) !important;" ></a>
+The original Windows 10 scripts are kept, unchanged, in [`Windows10-legacy/`](Windows10-legacy/).
+What changed and why: [`WINDOWS11-MIGRATION.md`](WINDOWS11-MIGRATION.md).
 
-Be sure to look at the Contributors' GitHubs to see if they have GitHub sponsorships as well since they have contributed to this open-source project. (https://github.com/Sycnex/Windows10Debloater/graphs/contributors)
+## Requirements
 
-## Disclaimer
+- Windows 11 (build 22000 or later)
+- PowerShell 5.1 (the built-in one - no PowerShell 7 needed)
+- Administrator rights (both scripts self-elevate)
 
-**WARNING:** I do **NOT** take responsibility for what may happen to your system! Run scripts at your own risk!
-Also, other variants of this repo are not technically "new" versions of this, but they are different in their own respective ways. There are some sites saying that other projects are "new" versions of this, but that is inaccurate. 
+## Quick start
 
-## How To Run the Windows10Debloater.ps1 and the Windows10DebloaterGUI.ps1 files
+Always preview first. It changes nothing and needs no elevation:
 
-There are different methods of running the PowerShell script. The methods are as follows:
+```powershell
+.\Win11Debloater.ps1 -Action DebloatBlacklist -DryRun
+```
 
-### First Method
+Then run for real, from an elevated prompt:
 
-1) Download the .zip file on the main page of the GitHub and extract the .zip file to your desired location
-2) Once extracted, open [PowerShell](https://docs.microsoft.com/en-us/powershell/scripting/overview?view=powershell-5.1) (or [PowerShell ISE](https://docs.microsoft.com/en-us/powershell/scripting/windows-powershell/ise/introducing-the-windows-powershell-ise?view=powershell-7)) as an Administrator
-3) Enable PowerShell execution
-<code>Set-ExecutionPolicy Unrestricted -Force</code>
-4) On the prompt, change to the directory where you extracted the files:
-  e.g. - `cd c:\temp`
-5) Next, to run either script, enter in the following:
-  e.g. - `.\Windows10DebloaterGUI.ps1`
+```powershell
+.\Win11Debloater.ps1                      # interactive menu
+.\Win11Debloater.ps1 -Action DebloatBlacklist
+.\Win11Debloater.ps1 -Action Privacy
+.\Win11Debloater.ps1 -Action Extras
+```
 
-### Second Method
+If PowerShell refuses to run the file:
 
-1) Download the .zip file on the main page of the GitHub and extract the .zip file to your desired location
-2) Right-click the PowerShell file that you'd like to run and click on "Run With PowerShell"
-3) This will allow the script to run without having to do the above steps but Powershell will ask if you're sure you want to run this script.
+```powershell
+Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass
+```
 
-Remember this script **NEEDS** to be run as admin in order to function properly.
+Or double-click `Win11DebloaterGUI.ps1` for the window version.
 
-## How To Run the Windows10SysPrepDebloater.ps1 file
+## Actions
 
-For the WindowsSysPrepDebloater.ps1 file, there are a couple of parameters that you can run so that you can specify which functions are used. The parameters are:
-`-SysPrep`, `-Debloat` and `-Privacy`.
+| Action | What it does |
+|---|---|
+| `Menu` | Interactive menu (default) |
+| `DebloatBlacklist` | Removes the curated Windows 11 bloat list only. Recommended. |
+| `DebloatAll` | Removes all non-protected Appx packages. Conservative unless `-Aggressive`. |
+| `Privacy` | Telemetry, advertising ID, Bing/web search, consumer content, Recall/AI, DiagTrack, telemetry tasks |
+| `Extras` | Copilot, widgets, Chat/Teams, Start recommendations, taskbar search box, update nags |
+| `Revert` | Re-enables services/tasks/registry and re-registers apps still on disk |
+| `Inventory` | Exports every Appx package to CSV on the Desktop and exits |
 
-To run this with parameters, do the following:
+## Switches
 
-1) Download the .zip file on the main page of the GitHub and extract the .zip file to your desired location
-2) Once extracted, open [PowerShell](https://docs.microsoft.com/en-us/powershell/scripting/overview?view=powershell-5.1) (or [PowerShell ISE](https://docs.microsoft.com/en-us/powershell/scripting/windows-powershell/ise/introducing-the-windows-powershell-ise?view=powershell-7)) as an Administrator
-3) On the prompt, change to the directory where you extracted the files:
-  e.g. - `cd c:\temp`
-4) Next, to run either script, enter in the following:
+| Switch | Effect |
+|---|---|
+| `-DryRun` | Report only. No changes anywhere. |
+| `-Aggressive` | With `DebloatAll`, also remove unclassified leftovers. Still respects the protected list. |
+| `-NoRestorePoint` | Skip the System Restore checkpoint. |
+| `-NoRebootPrompt` | Do not ask to reboot at the end (for unattended runs). |
+| `-KeepXbox` | Keep the Xbox app, Game Bar and Xbox services. |
+| `-KeepMdmService` | Keep `dmwappushservice` (Intune / MDM enrolled machines). |
+| `-DisableCopilot`, `-DisableWidgets`, `-DisableChat`, `-DisableStartAds`, `-DisableBingSearch` | Individual Windows 11 extras with `-Action Extras`. |
+| `-LogPath <file>` | Where to write the transcript. Default `%ProgramData%\Win11Debloater\`. |
 
-  e.g. - `.\Windows10SysPrepDebloater.ps1 -Sysprep -Debloat -Privacy`
+## Example: unattended run
 
+```powershell
+.\Win11Debloater.ps1 -Action DebloatBlacklist -NoRebootPrompt
+.\Win11Debloater.ps1 -Action Privacy -NoRestorePoint -NoRebootPrompt
+.\Win11Debloater.ps1 -Action Extras -NoRebootPrompt
+```
 
-## Sysprep, Interactive, and GUI Application
+## Custom blocklist
 
-There are now 3 versions of **Windows10Debloater** - There is an interactive version, a GUI app version, and a pure silent version.
+Create `custom-lists.ps1` next to `Win11Debloater.ps1` (regex fragments, matched
+against package names):
 
-- **`Windows10SysPrepDebloater.ps1`** -> The silent version now utilizes the switch parameters: -Sysprep, -Debloat -Privacy. The silent version can be useful for deploying MDT Images/sysprepping or any other way you deploy Windows 10. This will work to remove the bloatware during the deployment process.
+```powershell
+$global:ExtraBloat = @(
+    'Microsoft\.YourPhone'
+    'SomeVendor\.SomeApp'
+)
+```
 
-- **`Windows10Debloater.ps1`** -> This interactive version is what it implies - a Windows10Debloater script with interactive prompts. This one should not be used for deployments that require a silent script with optional parameters. This script gives you choices with prompts as it runs so that you can make the choices of what the script does.
+Both the console and the GUI pick it up automatically.
 
-- **`Windows10DebloaterGUI.ps1`** -> There is now a GUI Application named Windows10DebloaterGUI.ps1 with buttons to perform all of the functions that the scripts do. This is better for the average user who does not want to work with code, or if you'd prefer to just see an application screen. 
+## What is protected
 
-## Switch Parameters
+Nothing matching these is ever removed, whatever the switches say:
 
-There are 3 switch parameters in the `Windows10SysPrepDebloater.ps1` script.
+`MicrosoftWindows.*` (Windows 11 shell), `Microsoft.Windows.Client.*`,
+`Microsoft.WindowsStore`, `Microsoft.DesktopAppInstaller` (winget),
+`Microsoft.WindowsAppRuntime.*`, `Microsoft.UI.Xaml`, `Microsoft.VCLibs`,
+`Microsoft.NET.Native`, `Microsoft.Windows.ShellExperienceHost`,
+`Microsoft.Windows.StartMenuExperienceHost`, `Microsoft.Windows.SecHealthUI`
+(Defender), `Microsoft.Windows.Search`, and anything the package catalog itself
+flags as `NonRemovable` or `IsFramework`.
 
-- **`-SysPrep`**, which runs the command within a function: get-appxpackage | remove-appxpackage. This is useful since some administrators need that command to run first in order for machines to be able to properly provision the apps for removal.
+Calculator, Store, Photos, Camera, Notepad, Terminal, Paint, Snipping Tool,
+Media Player, Voice Recorder and the media extensions are on the keep list -
+removable by hand, never by `DebloatAll`.
 
-- **`-Debloat`**, switch parameter which does as it suggests. It runs the following functions: Start-Debloat, Remove-Keys, and Protect-Privacy.
-Remove-Keys removes registry keys leftover that are associated with the bloatware apps listed above, but not removed during the Start-Debloat function.
+## Files
 
-- **`-Privacy`**, adds and/or changes registry keys to stop some telemetry functions, stops Cortana from being used as your Search Index, disables "unnecessary" scheduled tasks, and more.
+```
+Win11Debloater.ps1           console / interactive
+Win11DebloaterGUI.ps1        WinForms front-end
+lib/Win11Debloat.Core.ps1    shared functions (both entry points use this)
+WINDOWS11-MIGRATION.md       change log and verification results
+Windows10-legacy/            the original Windows 10 scripts, untouched
+```
 
-***This script will remove the bloatware from Windows 10 when using Remove-AppXPackage/Remove-AppXProvisionedPackage, and then delete specific registry keys that are were not removed beforehand. For best results, this script should be run before a user profile is configured, otherwise, you will likely see that apps that should have been removed will remain, and if they are removed you will find broken tiles on the start menu.***
+## Before you run it
 
-## These registry keys are
+Removing Appx packages uninstalls apps and their local data. Make sure System
+Restore is enabled, or take an image first, and read the `-DryRun` output.
+Scripts are provided as-is, no warranty - same terms as upstream.
 
-EclipseManager,
-ActiproSoftwareLLC,
-Microsoft.PPIProjection,
-Microsoft.XboxGameCallableUI
+## Licence
 
-You can choose to either 'Debloat' or 'Revert'. Depending on your choice, either one will run specific code to either debloat your Windows 10 machine.
-
-## The Debloat switch choice runs the following functions
-
-Debloat,
-Remove-Keys,
-Protect-Privacy,
-Stop-EdgePDF (If chosen)
-
-## The Revert switch choice runs the following functions
-
-Revert-Changes,
-Enable-EdgePDF
-
-The Revert option reinstalls the bloatware and changes your registry keys back to default. 
-
-## The scheduled tasks that are disabled are
-
-XblGameSaveTaskLogon,
-XblGameSaveTask,
-Consolidator,
-UsbCeip,
-DmClient
-
-These scheduled tasks that are disabled have absolutely no impact on the function of the OS.
-
-## Bloatware that is removed
-
-[3DBuilder](https://www.microsoft.com/en-us/p/3d-builder/9wzdncrfj3t6),
-[ActiproSoftware](https://www.microsoft.com/en-us/p/actipro-universal-windows-controls/9wzdncrdlvzp),
-[Alarms](https://www.microsoft.com/en-us/p/windows-alarms-clock/9wzdncrfj3pr?activetab=pivot:overviewtab),
-[Appconnector](https://www.microsoft.com/en-us/p/connector/9wzdncrdjmlj?activetab=pivot:overviewtab),
-[Asphalt8](https://www.microsoft.com/en-us/p/asphalt-8-racing-game-drive-drift-at-real-speed/9wzdncrfj26j?activetab=pivot:overviewtab),
-[Autodesk SketchBook](https://www.microsoft.com/en-us/p/autodesk-sketchbook/9nblggh4vzw5),
-[MSN Money](https://www.microsoft.com/en-us/p/msn-money/9wzdncrfhv4v?activetab=pivot:overviewtab),
-[Food And Drink](https://www.microsoft.com/en-us/p/food-and-drink/9nblggh0jhqg),
-[Health And Fitness](https://www.microsoft.com/en-us/p/health-fitness-free/9wzdncrcwcdp),
-[Microsoft News](https://www.microsoft.com/en-us/p/microsoft-news/9wzdncrfhvfw#activetab=pivot:overviewtab),
-[MSN Sports](https://www.microsoft.com/en-us/p/msn-sports/9wzdncrfhvh4?activetab=pivot:overviewtab),
-[MSN Travel](https://www.microsoft.com/en-us/p/msn-travel/9wzdncrfj3ft?activetab=pivot:overviewtab),
-[MSN Weather](https://www.microsoft.com/en-us/p/msn-weather/9wzdncrfj3q2?activetab=pivot:overviewtab),
-BioEnrollment,
-[Windows Camera](https://www.microsoft.com/en-us/p/windows-camera/9wzdncrfjbbg#activetab=pivot:overviewtab),
-CandyCrush,
-CandyCrushSoda,
-Caesars Slots Free Casino,
-ContactSupport,
-CyberLink MediaSuite Essentials,
-DrawboardPDF,
-Duolingo,
-EclipseManager,
-Facebook,
-FarmVille 2 Country Escape,
-Flipboard,
-Fresh Paint,
-Get started,
-iHeartRadio,
-King apps,
-Maps,
-March of Empires,
-Messaging,
-Microsoft Office Hub,
-Microsoft Solitaire Collection,
-Microsoft Sticky Notes,
-Minecraft,
-Netflix,
-Network Speed Test,
-NYT Crossword,
-Office Sway,
-OneNote,
-OneConnect,
-Pandora,
-People,
-Phone,
-Phototastic Collage,
-PicsArt-PhotoStudio,
-PowerBI,
-Royal Revolt 2,
-Shazam,
-Skype for Desktop,
-SoundRecorder,
-TuneInRadio,
-Twitter,
-Windows communications apps,
-Windows Feedback,
-Windows Feedback Hub,
-Windows Reading List,
-XboxApp,
-Xbox Game CallableUI,
-Xbox Identity Provider,
-Zune Music,
-Zune Video.
-
-## Quick download link
-
-`iwr -useb https://git.io/debloat|iex`
-
-## Allowlist and Blocklist
-There may be some confusion, but when using the Allowlist/Blocklist, the checkmark means it is on the blocklist, and that it will be removed.
-
-## Credits
-
-Thank you to [a60wattfish](https://github.com/a60wattfish), [abulgatz](abulgatz), [xsisbest](https://github.com/xsisbest), [Damian](https://github.com/Damian), [Vikingat-RAGE](https://github.com/Vikingat-RAGE), Reddit user [/u/GavinEke](https://github.com/GavinEke), and all of the contributors (https://github.com/Sycnex/Windows10Debloater/graphs/contributors) for the suggestions, code, changes, and fixes that you have all graciously worked hard on and shared! You all have done a fantastic job!
+MIT, inherited from the upstream project. Original work by Sycnex and
+contributors.
