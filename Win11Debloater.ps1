@@ -19,21 +19,33 @@ param(
     [switch]$DisableStartAds,
     [switch]$DisableBingSearch,
 
-    [string]$LogPath
+    [string]$LogPath,
+
+    # Diagnostics: write the elevation launcher this build would use and exit.
+    # Mainly for testing the piped (irm | iex) path without a UAC prompt.
+    [string]$EmitElevationLauncher
 )
 
 $ErrorActionPreference = 'Continue'
 
-# Load the shared library (same functions the GUI uses).
+# >>> LIBRARY LOADER (tools\Build-Standalone.ps1 replaces this block with lib\Win11Debloat.Core.ps1)
+$script:StandaloneUrl = ''
 $corePath = Join-Path $PSScriptRoot 'lib\Win11Debloat.Core.ps1'
 if (!(Test-Path $corePath)) {
     Write-Host "Missing library: $corePath" -ForegroundColor Red
+    Write-Host 'If you piped this script into iex, use dist\Win11Debloater.standalone.ps1 instead.'
     exit 1
 }
 . $corePath
 
-$customLists = Join-Path $PSScriptRoot 'custom-lists.ps1'
-if (Test-Path $customLists) { . $customLists }
+if (![string]::IsNullOrEmpty($PSScriptRoot)) {
+    $customLists = Join-Path $PSScriptRoot 'custom-lists.ps1'
+    if (Test-Path $customLists) { . $customLists }
+}
+# <<< LIBRARY LOADER
+
+# Switches the caller passed, so elevation can re-apply them.
+$script:BoundArgs = $PSBoundParameters
 
 # --------------------------------------------------------------------------
 # Main
@@ -47,6 +59,18 @@ if ($info.IsWindows11) { $productLabel = $productLabel -replace 'Windows 10', 'W
 Write-Log ("Windows: {0} {1} build {2}.{3}" -f $productLabel, $info.DisplayVer, $info.Build, $info.UBR)
 if (!$info.IsWindows11) {
     Write-Log 'This build is NOT Windows 11 (build < 22000). The package lists are tuned for Windows 11 and may behave oddly on Windows 10.' 'WARN'
+}
+
+if (![string]::IsNullOrEmpty($EmitElevationLauncher)) {
+    try {
+        New-ElevationLauncher -Path $EmitElevationLauncher | Out-Null
+        Write-Log "elevation launcher written: $EmitElevationLauncher" 'OK'
+    }
+    catch {
+        Write-Log "could not write launcher: $($_.Exception.Message)" 'ERROR'
+    }
+    Stop-Log
+    exit
 }
 
 if (!(Test-Admin)) {

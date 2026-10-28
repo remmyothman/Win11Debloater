@@ -1,0 +1,1306 @@
+# =============================================================================
+#  Win11Debloater - single-file build. GENERATED FILE, DO NOT EDIT.
+#  Source: Win11Debloater.ps1 + lib\Win11Debloat.Core.ps1
+#  Rebuild with: tools\Build-Standalone.ps1
+#  Safe to run as: irm <raw url of this file> | iex
+# =============================================================================
+param(
+    [ValidateSet('Menu', 'DebloatAll', 'DebloatBlacklist', 'Privacy', 'Extras', 'Revert', 'Inventory')]
+    [string]$Action = 'Menu',
+
+    [switch]$DryRun,
+    [switch]$Aggressive,
+    [switch]$NoRestorePoint,
+    [switch]$NoRebootPrompt,
+    [switch]$KeepXbox,
+    [switch]$KeepMdmService,
+    [switch]$KeepSearchService,
+    [switch]$UninstallOneDrive,
+    [switch]$UnpinStart,
+    [switch]$Remove3dObjects,
+    [switch]$DisableTelemetry,
+    [switch]$DisableCopilot,
+    [switch]$DisableWidgets,
+    [switch]$DisableChat,
+    [switch]$DisableStartAds,
+    [switch]$DisableBingSearch,
+
+    [string]$LogPath,
+
+    # Diagnostics: write the elevation launcher this build would use and exit.
+    # Mainly for testing the piped (irm | iex) path without a UAC prompt.
+    [string]$EmitElevationLauncher
+)
+
+$ErrorActionPreference = 'Continue'
+
+# >>> LIBRARY LOADER (inlined by tools\Build-Standalone.ps1)
+$script:StandaloneUrl = 'https://raw.githubusercontent.com/remmyothman/Win11Debloater/master/dist/Win11Debloater.standalone.ps1'
+# Custom blocklists are read from custom-lists.ps1 next to a script on disk;
+# a piped build has no folder, so that feature is file-based only.
+# <<< LIBRARY LOADER
+Set-StrictMode -Off
+
+# --------------------------------------------------------------------------
+# Shared session state. The caller sets $DryRun before calling anything.
+# --------------------------------------------------------------------------
+
+$script:AppxCache = $null
+$script:ProtectedPatterns = $null
+$script:ProtectedNames = $null
+$script:TranscriptOn = $false
+if ($null -eq $script:Stats) {
+    $script:Stats = @{
+        Removed  = 0
+        Skipped  = 0
+        Failed   = 0
+        Settings = 0
+        Tasks    = 0
+        Services = 0
+        Errors   = New-Object System.Collections.ArrayList
+    }
+}
+
+$ErrorActionPreference = 'Continue'
+$ProgressPreference = 'SilentlyContinue'
+
+# --------------------------------------------------------------------------
+# Session / environment
+# --------------------------------------------------------------------------
+
+$script:Stats = @{
+    Removed  = 0
+    Skipped  = 0
+    Failed   = 0
+    Settings = 0
+    Tasks    = 0
+    Services = 0
+    Errors   = New-Object System.Collections.ArrayList
+}
+
+function Write-Log {
+    param([string]$Message, [string]$Level = 'INFO')
+    $stamp = (Get-Date).ToString('HH:mm:ss')
+    $line = "[$stamp][$Level] $Message"
+    switch ($Level) {
+        'ERROR' { Write-Host $line -ForegroundColor Red }
+        'WARN'  { Write-Host $line -ForegroundColor Yellow }
+        'OK'    { Write-Host $line -ForegroundColor Green }
+        'DRY'   { Write-Host $line -ForegroundColor Cyan }
+        default { Write-Host $line }
+    }
+}
+
+function Initialize-Log {
+    if ([string]::IsNullOrEmpty($LogPath)) {
+        $dir = Join-Path $env:ProgramData 'Win11Debloater'
+        if (!(Test-Path $dir)) { New-Item -Path $dir -ItemType Directory -Force | Out-Null }
+        $LogPath = Join-Path $dir ("Win11Debloater-{0}.log" -f (Get-Date).ToString('yyyyMMdd-HHmmss'))
+    }
+    try {
+        Start-Transcript -Path $LogPath -Force | Out-Null
+        $script:TranscriptOn = $true
+    }
+    catch {
+        Write-Log "Could not start transcript at $LogPath - continuing without a log file." 'WARN'
+        $script:TranscriptOn = $false
+    }
+    Write-Log "Log: $LogPath"
+}
+
+function Stop-Log {
+    if ($script:TranscriptOn) { try { Stop-Transcript | Out-Null } catch { } }
+}
+
+function Test-Admin {
+    $id = [Security.Principal.WindowsIdentity]::GetCurrent()
+    $pr = New-Object Security.Principal.WindowsPrincipal($id)
+    return $pr.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+}
+
+function Get-SelfPath {
+    # Empty when the script was piped into iex: there is no file to relaunch.
+    if (![string]::IsNullOrEmpty($PSCommandPath)) { return $PSCommandPath }
+    try {
+        if (![string]::IsNullOrEmpty($MyInvocation.MyCommand.Path)) { return $MyInvocation.MyCommand.Path }
+    }
+    catch { }
+    return $null
+}
+
+function Get-BoundArgumentTokens {
+    # Re-serialise the switches the caller actually passed, so elevation cannot
+    # silently drop them (the original script rebuilt the list by hand).
+    $tokens = New-Object System.Collections.ArrayList
+    $bound = $script:BoundArgs
+    if ($null -eq $bound) { return @() }
+    foreach ($k in $bound.Keys) {
+        if ($k -eq 'EmitElevationLauncher') { continue }
+        $v = $bound[$k]
+        if ($v -is [System.Management.Automation.SwitchParameter]) {
+            if ($v.IsPresent) { [void]$tokens.Add("-$k") }
+        }
+        elseif ($v -is [bool]) {
+            if ($v) { [void]$tokens.Add("-$k") }
+        }
+        elseif ($null -ne $v -and "$v" -ne '') {
+            [void]$tokens.Add("-$k")
+            [void]$tokens.Add("$v")
+        }
+    }
+    return $tokens.ToArray()
+}
+
+function Get-BoundArgumentString {
+    # Same tokens, but as one quoted string for a generated launcher file.
+    $parts = @()
+    foreach ($t in (Get-BoundArgumentTokens)) {
+        if ($t -match '^-') { $parts += $t }
+        else { $parts += "'" + ($t -replace "'", "''") + "'" }
+    }
+    return ($parts -join ' ')
+}
+
+function New-ElevationLauncher {
+    # Writes a small .ps1 that re-fetches the published standalone build and
+    # re-runs it elevated with the same switches. Needed because a piped script
+    # has no $PSCommandPath to hand to Start-Process -File.
+    param([Parameter(Mandatory)][string]$Path)
+
+    if ([string]::IsNullOrEmpty($script:StandaloneUrl)) {
+        throw 'No standalone URL is baked into this build, so it cannot re-fetch itself.'
+    }
+
+    $argString = Get-BoundArgumentString
+    $body = @"
+# Generated by Win11Debloater to re-run the piped build with administrator rights.
+`$ProgressPreference = 'SilentlyContinue'
+`$ErrorActionPreference = 'Stop'
+try {
+    `$src = (Invoke-WebRequest -UseBasicParsing -Uri '$($script:StandaloneUrl)').Content
+}
+catch {
+    Write-Host "Could not download the debloater again: `$(`$_.Exception.Message)" -ForegroundColor Red
+    exit 1
+}
+& ([scriptblock]::Create(`$src)) $argString
+"@
+    $body | Out-File -FilePath $Path -Encoding UTF8 -Force
+    return $Path
+}
+
+function Invoke-SelfElevate {
+    if (Test-Admin) { return $true }
+
+    # Guards against a UAC loop if the elevated child still is not admin.
+    if ($env:WIN11DEBLOAT_ELEVATING -eq '1') {
+        Write-Host 'Relaunched but still not running as Administrator - stopping.' -ForegroundColor Red
+        Write-Host 'Right-click PowerShell, choose "Run as administrator", then run the script again.'
+        return $false
+    }
+
+    $selfPath = Get-SelfPath
+    $argTokens = Get-BoundArgumentTokens
+    $env:WIN11DEBLOAT_ELEVATING = '1'
+
+    try {
+        if ($selfPath) {
+            Write-Host "Not elevated - relaunching $selfPath with a UAC prompt..."
+            $argList = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', "`"$selfPath`"") + $argTokens
+            Start-Process -FilePath 'powershell.exe' -ArgumentList $argList -Verb RunAs | Out-Null
+        }
+        elseif (![string]::IsNullOrEmpty($script:StandaloneUrl)) {
+            Write-Host 'Not elevated - re-fetching the build and relaunching it with a UAC prompt...'
+            $launcher = Join-Path $env:TEMP ("Win11Debloater-elevate-{0}.ps1" -f (Get-Date).ToString('yyyyMMdd-HHmmss'))
+            New-ElevationLauncher -Path $launcher | Out-Null
+            Start-Process -FilePath 'powershell.exe' -ArgumentList @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', "`"$launcher`"") -Verb RunAs | Out-Null
+        }
+        else {
+            Write-Host 'Not elevated, and this build has no file path or URL to relaunch from.' -ForegroundColor Red
+            Write-Host 'Save the script to disk and run it again, or start PowerShell as Administrator first.'
+            return $false
+        }
+    }
+    catch {
+        Write-Host 'Elevation was declined or failed. This script needs Administrator rights.' -ForegroundColor Red
+        Write-Host 'Right-click PowerShell, choose "Run as administrator", then run the script again.'
+        return $false
+    }
+    finally {
+        Remove-Item env:WIN11DEBLOAT_ELEVATING -ErrorAction SilentlyContinue
+    }
+
+    return $false
+}
+
+function Get-Win11Info {
+    $cv = Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion'
+    [pscustomobject]@{
+        ProductName  = $cv.ProductName
+        DisplayVer   = $cv.DisplayVersion
+        Build        = [int]$cv.CurrentBuild
+        UBR          = $cv.UBR
+        Edition      = $cv.EditionID
+        IsWindows11  = ([int]$cv.CurrentBuild -ge 22000)
+    }
+}
+
+# --------------------------------------------------------------------------
+# Small helpers
+# --------------------------------------------------------------------------
+
+function Invoke-Step {
+    # Runs a script block unless -DryRun, so every mutation goes through one gate.
+    param(
+        [scriptblock]$Script,
+        [string]$Description,
+        [switch]$AllowDryRunSkip
+    )
+    if ($DryRun -and !$AllowDryRunSkip) {
+        Write-Log "would: $Description" 'DRY'
+        return $null
+    }
+    try {
+        return (& $Script)
+    }
+    catch {
+        Write-Log "$Description - $($_.Exception.Message)" 'ERROR'
+        [void]$script:Stats.Errors.Add("$Description :: $($_.Exception.Message)")
+        $script:Stats.Failed++
+        return $null
+    }
+}
+
+function Set-RegValue {
+    param(
+        [string]$Path,
+        [string]$Name,
+        $Value,
+        [ValidateSet('DWORD', 'String', 'ExpandString', 'QWord', 'Binary')]
+        [string]$Type = 'DWORD'
+    )
+    $desc = "Set $Path\$Name = $Value"
+    if ($DryRun) {
+        Write-Log "would: $desc" 'DRY'
+        $script:Stats.Settings++
+        return
+    }
+    try {
+        if (!(Test-Path $Path)) { New-Item -Path $Path -Force -ErrorAction Stop | Out-Null }
+        if ($null -eq $Value) {
+            Remove-ItemProperty -Path $Path -Name $Name -Force -ErrorAction SilentlyContinue
+        }
+        else {
+            New-ItemProperty -Path $Path -Name $Name -Value $Value -PropertyType $Type -Force -ErrorAction Stop | Out-Null
+        }
+        Write-Log $desc 'OK'
+        $script:Stats.Settings++
+    }
+    catch {
+        Write-Log "FAILED  $desc - $($_.Exception.Message)" 'ERROR'
+        [void]$script:Stats.Errors.Add("$desc :: $($_.Exception.Message)")
+        $script:Stats.Failed++
+    }
+}
+
+# --------------------------------------------------------------------------
+# Appx: protected list, keep list, bloat list
+# --------------------------------------------------------------------------
+
+function Get-ProtectedAppxPatterns {
+    # Anything matching here is never removed, whatever -Action says.
+    # On Windows 11, removing these breaks the shell, Settings, Defender,
+    # the Store or winget. The original Windows 10 script had no MicrosoftWindows.*
+    # or WinAppRuntime protection at all.
+    $patterns = @(
+        '^Microsoft\.VCLibs'
+        '^Microsoft\.NET\.Native'
+        '^Microsoft\.UI\.Xaml'
+        '^Microsoft\.WindowsAppRuntime'
+        '^Microsoft\.WinAppRuntime'
+        '^MicrosoftCorporationII\.WinAppRuntime'
+        '^Microsoft\.Services\.Store\.Engagement'
+        '^MicrosoftWindows\.'                      # Win11 system shell packages
+        '^Microsoft\.Windows\.ShellExperienceHost'
+        '^Microsoft\.Windows\.StartMenuExperienceHost'
+        '^Microsoft\.Windows\.Search'
+        '^Microsoft\.Windows\.Client\.'
+        '^Microsoft\.Windows\.CloudExperienceHost'
+        '^Microsoft\.Windows\.ContentDeliveryManager'
+        '^Microsoft\.Windows\.OOBENetwork'
+        '^Microsoft\.Windows\.ParentalControls'
+        '^Microsoft\.Windows\.PeopleExperienceHost'
+        '^Microsoft\.Windows\.PinningConfirmationDialog'
+        '^Microsoft\.Windows\.PrintQueueActionCenter'
+        '^Microsoft\.Windows\.SecHealthUI'          # Defender UI
+        '^Microsoft\.Windows\.SecureAssessmentBrowser'
+        '^Microsoft\.Windows\.XGpuEjectDialog'
+        '^Microsoft\.Windows\.AssignedAccessLockApp'
+        '^Microsoft\.Windows\.CapturePicker'
+        '^Microsoft\.Windows\.Apprep\.ChxApp'
+        '^Microsoft\.Windows\.CallingShellApp'
+        '^Microsoft\.Windows\.AugLoop'
+        '^Microsoft\.AAD\.BrokerPlugin'
+        '^Microsoft\.AccountsControl'
+        '^Microsoft\.BioEnrollment'
+        '^Microsoft\.CredDialogHost'
+        '^Microsoft\.ECApp'
+        '^Microsoft\.LockApp'
+        '^Microsoft\.PPIProjection'
+        '^Microsoft\.Win32WebViewHost'
+        '^Microsoft\.XboxGameCallableUI'
+        '^Microsoft\.DesktopAppInstaller'           # winget
+        '^Microsoft\.WindowsStore'
+        '^Microsoft\.StorePurchaseApp'
+        '^Microsoft\.WindowsTerminal'               # devs rely on this
+        '^Microsoft\.WindowsNotepad'
+        '^Microsoft\.Paint'
+        '^Microsoft\.MSPaint'
+        '^Microsoft\.ScreenSketch'
+        '^Microsoft\.WindowsCalculator'
+        '^Microsoft\.Windows\.Photos'
+        '^Microsoft\.WindowsCamera'
+        'OneNoteVirtualPrinter'                     # print-to-OneNote driver, not the app
+        '^Microsoft\.Windows\.Notepad'
+        '^Microsoft\.HEIFImageExtension'
+        '^Microsoft\.VP9VideoExtensions'
+        '^Microsoft\.WebMediaExtensions'
+        '^Microsoft\.WebpImageExtension'
+        '^Microsoft\.AV1VideoExtension'
+        '^Microsoft\.MPEG2VideoExtension'
+        '^Microsoft\.RawImageExtension'
+        '^Microsoft\.WindowsAppRuntime'
+        '^Microsoft\.WidgetsPlatformRuntime'
+        '^Microsoft\.Winget\.'
+        '^Microsoft\.StartExperiencesApp'
+        '^windows\.immersivecontrolpanel'
+        '^Windows\.CBSPreview'
+        '^Windows\.PrintDialog'
+        '^NcsiUwpApp'
+        '^InputApp'
+        '^MicrosoftWindows\.UndockedDevKit'
+        '^[0-9a-fA-F]{8}-'                          # GUID-named system packages
+    )
+    return $patterns
+}
+
+function Get-KeepAppxPatterns {
+    # Apps most people want. Protected from DebloatAll, still removable by hand.
+    return @(
+        'Microsoft\.WindowsCalculator'
+        'Microsoft\.WindowsStore'
+        'Microsoft\.Windows\.Photos'
+        'Microsoft\.WindowsCamera'
+        'Microsoft\.WindowsNotepad'
+        'Microsoft\.WindowsTerminal'
+        'Microsoft\.Paint'
+        'Microsoft\.MSPaint'
+        'Microsoft\.ScreenSketch'
+        'Microsoft\.ZuneMusic'                      # Windows 11 Media Player
+        'Microsoft\.MicrosoftStickyNotes'
+        'Microsoft\.WindowsSoundRecorder'           # Voice Recorder, useful for instructors
+        'Microsoft\.Windows\.DevHome'
+        'CanonicalGroupLimited\.Ubuntu'
+        'Microsoft\.DotNet\.Native'
+        'Microsoft\.HEIFImageExtension'
+        'Microsoft\.VP9VideoExtensions'
+        'Microsoft\.WebMediaExtensions'
+        'Microsoft\.WebpImageExtension'
+        'Microsoft\.AV1VideoExtension'
+        'Microsoft\.DesktopAppInstaller'
+        'WindSynthBerry'
+        'MIDIBerry'
+        'Slack'
+    )
+}
+
+function Get-BloatwareList {
+    # Curated Windows 11 consumer bloat. Checked against the live catalog before
+    # removal, so absent packages are skipped silently instead of erroring.
+    $list = @(
+        # --- Microsoft consumer apps (present on Win11 22H2 - 25H2) ---
+        'Microsoft\.BingNews'
+        'Microsoft\.BingWeather'
+        'Microsoft\.BingFinance'
+        'Microsoft\.BingSports'
+        'Microsoft\.GetHelp'
+        'Microsoft\.Getstarted'                     # Tips
+        'Microsoft\.MicrosoftOfficeHub'
+        'Microsoft\.MicrosoftSolitaireCollection'
+        'Microsoft\.MixedReality\.Portal'           # no WMR on Win11 24H2+
+        'Microsoft\.People'                         # People app, no taskbar band on Win11
+        'Microsoft\.SkypeApp'
+        'Microsoft\.WindowsAlarms'
+        'Microsoft\.WindowsFeedbackHub'
+        'Microsoft\.WindowsMaps'
+        'Microsoft\.WindowsCommunicationsApps'      # Mail & Calendar, superseded
+        'microsoft\.windowscommunicationsapps'
+        'Microsoft\.WindowsFeedbackHub'
+        'Microsoft\.YourPhone'                      # Phone Link
+        'MicrosoftCorporationII\.MicrosoftFamily'
+        'Microsoft\.MicrosoftFamily'
+        'MicrosoftCorporationII\.QuickAssist'
+        'Microsoft\.PowerAutomateDesktop'
+        'Microsoft\.Todos'
+        'Microsoft\.Windows\.DevHome'
+        'Microsoft\.OutlookForWindows'              # new Outlook
+        'Microsoft\.Windows\.Copilot'
+        'Microsoft\.Copilot'
+        'Microsoft\.Windows\.Ai\.Copilot\.Provider'
+        'Clipchamp\.Clipchamp'
+        'Microsoft\.Microsoft3DViewer'
+        'Microsoft\.Print3D'
+        'Microsoft\.OneConnect'
+        'Microsoft\.Office\.Lens'
+        'Microsoft\.Office\.OneNote'
+        'Microsoft\.Office\.Sway'
+        'Microsoft\.Office\.Todo\.List'
+        'Microsoft\.NetworkSpeedTest'
+        'Microsoft\.Messaging'
+        'Microsoft\.RemoteDesktop'
+        'Microsoft\.Whiteboard'
+        'Microsoft\.Wallet'
+        'Microsoft\.549981C3F5F10'                  # legacy Cortana package id
+        'Microsoft\.Windows\.Cortana'
+        'Microsoft\.ZuneVideo'                      # Movies & TV
+        'Microsoft\.WindowsMediaPlayer'             # legacy WMP app (Win11 24H2+)
+
+        # --- Teams / Chat ---
+        '^MicrosoftTeams$'                          # consumer "Chat" app shipped with Win11
+        # '^MSTeams$'                               # work/school Teams - left in place by default,
+                                                    # uncomment for a personal machine or use -Aggressive
+
+        # --- Xbox stack (kept when -KeepXbox) ---
+        'Microsoft\.XboxApp'
+        'Microsoft\.XboxGameOverlay'
+        'Microsoft\.XboxGamingOverlay'
+        'Microsoft\.XboxIdentityProvider'
+        'Microsoft\.XboxSpeechToTextOverlay'
+        'Microsoft\.Xbox\.TCUI'
+
+        # --- Sponsored / third-party stubs shipped in images ---
+        'EclipseManager'
+        'ActiproSoftwareLLC'
+        'AdobeSystemsIncorporated\.AdobeExpress'
+        'Duolingo-LearnLanguagesforFree'
+        'PandoraMediaInc'
+        'CandyCrush'
+        'BubbleWitch3Saga'
+        'Wunderlist'
+        'Flipboard'
+        'Twitter'
+        'Facebook'
+        'Instagram'
+        'TikTok'
+        'Netflix'
+        'Disney'
+        'PrimeVideo'
+        'Minecraft'
+        'Royal Revolt'
+        'Sway'
+        'Speed Test'
+        'McAfee'
+        'Norton'
+        'WinZip'
+        'Booking'
+    )
+    if ($KeepXbox) {
+        $list = $list | Where-Object { $_ -notmatch 'Xbox' }
+    }
+    # custom-lists.ps1 next to the entry script may add patterns of its own.
+    if ($global:ExtraBloat) { $list = $list + $global:ExtraBloat }
+    return $list
+}
+
+function Get-ProtectedPackageName {
+    # Union of catalog-reported non-removables, frameworks and our regex list.
+    $names = New-Object System.Collections.ArrayList
+    # Enumerating the catalog costs ~1s per call on Win11, so cache it once.
+    if ($null -eq $script:AppxCache) {
+        $script:AppxCache = @(Get-AppxPackage -AllUsers -ErrorAction SilentlyContinue)
+    }
+    foreach ($p in $script:AppxCache) {
+        if ($p.NonRemovable -eq $true -or $p.IsFramework -eq $true) { [void]$names.Add($p.Name) }
+    }
+    foreach ($p in (Get-AppxProvisionedPackage -Online -ErrorAction SilentlyContinue)) {
+        if ($p.NonRemovable -eq $true) { [void]$names.Add($p.DisplayName) }
+    }
+    return $names | Sort-Object -Unique
+}
+
+function Test-AppxProtected {
+    param([string]$Name)
+
+    if ([string]::IsNullOrEmpty($Name)) { return $true }
+    if ($script:ProtectedNames -contains $Name) { return $true }
+
+    foreach ($rx in $script:ProtectedPatterns) {
+        if ($Name -match $rx) { return $true }
+    }
+    return $false
+}
+
+function Remove-AppxSafely {
+    param(
+        [string]$Name,
+        [switch]$IncludeProvisioned
+    )
+
+    if (Test-AppxProtected -Name $Name) {
+        Write-Log "protected, skipping: $Name" 'WARN'
+        $script:Stats.Skipped++
+        return
+    }
+
+    if ($null -eq $script:AppxCache) {
+        $script:AppxCache = @(Get-AppxPackage -AllUsers -ErrorAction SilentlyContinue)
+    }
+    $installed = @($script:AppxCache | Where-Object { $_.Name -eq $Name })
+    if ($installed.Count -eq 0) {
+        $prov = @(Get-AppxProvisionedPackage -Online -ErrorAction SilentlyContinue | Where-Object { $_.DisplayName -eq $Name })
+        if ($prov.Count -eq 0) {
+            Write-Log "not installed: $Name" 'DRY'
+            $script:Stats.Skipped++
+            return
+        }
+    }
+
+    if ($DryRun) {
+        Write-Log "would remove: $Name  ($($installed.Count) package instance(s))" 'DRY'
+        $script:Stats.Removed++
+        return
+    }
+
+    $ok = $false
+    foreach ($pkg in $installed) {
+        try {
+            Remove-AppxPackage -Package $pkg.PackageFullName -AllUsers -ErrorAction Stop
+            $ok = $true
+        }
+        catch {
+            try {
+                Remove-AppxPackage -Package $pkg.PackageFullName -ErrorAction Stop
+                $ok = $true
+            }
+            catch {
+                Write-Log "could not remove $Name ($($pkg.PackageFullName)) - $($_.Exception.Message)" 'ERROR'
+                [void]$script:Stats.Errors.Add("Remove-AppxPackage $Name :: $($_.Exception.Message)")
+            }
+        }
+    }
+
+    if ($IncludeProvisioned) {
+        foreach ($pkg in @(Get-AppxProvisionedPackage -Online -ErrorAction SilentlyContinue | Where-Object { $_.DisplayName -eq $Name })) {
+            try {
+                Remove-AppxProvisionedPackage -Online -PackageName $pkg.PackageName -ErrorAction Stop | Out-Null
+                Write-Log "deprovisioned: $Name" 'OK'
+            }
+            catch {
+                Write-Log "could not deprovision $Name - $($_.Exception.Message)" 'WARN'
+            }
+        }
+    }
+
+    if ($ok) {
+        Write-Log "removed: $Name" 'OK'
+        $script:Stats.Removed++
+    }
+    else {
+        $script:Stats.Failed++
+    }
+}
+
+function Invoke-DebloatBlacklist {
+    Write-Log '--- Removing curated bloatware list ---'
+    $patterns = Get-BloatwareList
+    $all = @($script:AppxCache)
+    $prov = @(Get-AppxProvisionedPackage -Online -ErrorAction SilentlyContinue)
+
+    $targets = New-Object System.Collections.ArrayList
+    foreach ($p in $all) {
+        foreach ($rx in $patterns) {
+            if ($p.Name -match $rx) { [void]$targets.Add($p.Name); break }
+        }
+    }
+    foreach ($p in $prov) {
+        foreach ($rx in $patterns) {
+            if ($p.DisplayName -match $rx) { [void]$targets.Add($p.DisplayName); break }
+        }
+    }
+    $targets = $targets | Sort-Object -Unique
+
+    if ($targets.Count -eq 0) {
+        Write-Log 'Nothing from the bloat list is installed. Nothing to do.' 'OK'
+        return
+    }
+    Write-Log ("{0} package(s) matched the bloat list." -f $targets.Count)
+    foreach ($t in $targets) { Remove-AppxSafely -Name $t -IncludeProvisioned }
+}
+
+function Invoke-DebloatAll {
+    Write-Log '--- Removing all non-protected Appx packages ---'
+    $keep = Get-KeepAppxPatterns
+    $all = @($script:AppxCache)
+    $names = $all | Select-Object -ExpandProperty Name -Unique
+
+    if (!$Aggressive) {
+        Write-Log 'Mode: conservative (curated list only). Use -Aggressive to include unclassified leftovers.' 'WARN'
+        Invoke-DebloatBlacklist
+        return
+    }
+
+    foreach ($n in $names) {
+        if (Test-AppxProtected -Name $n) { $script:Stats.Skipped++; continue }
+        $isKeep = $false
+        foreach ($rx in $keep) { if ($n -match $rx) { $isKeep = $true; break } }
+        if ($isKeep) { Write-Log "keep-list: $n" 'WARN'; $script:Stats.Skipped++; continue }
+        Remove-AppxSafely -Name $n -IncludeProvisioned
+    }
+
+    foreach ($p in @(Get-AppxProvisionedPackage -Online -ErrorAction SilentlyContinue)) {
+        if (Test-AppxProtected -Name $p.DisplayName) { continue }
+        try {
+            if ($DryRun) { Write-Log "would deprovision: $($p.DisplayName)" 'DRY' }
+            else {
+                Remove-AppxProvisionedPackage -Online -PackageName $p.PackageName -ErrorAction Stop | Out-Null
+                Write-Log "deprovisioned: $($p.DisplayName)" 'OK'
+            }
+        }
+        catch { Write-Log "deprovision failed: $($p.DisplayName)" 'WARN' }
+    }
+}
+
+function Remove-LeftoverKeys {
+    # Contract registrations left behind by removed stubs. Read-only checks first,
+    # so this is harmless if the package was never installed.
+    Write-Log '--- Cleaning leftover Appx contract keys ---'
+    if (!(Get-PSDrive -Name HKCR -ErrorAction SilentlyContinue)) {
+        Invoke-Step -Description 'Mount HKCR: drive' -Script { New-PSDrive -Name HKCR -PSProvider Registry -Root HKEY_CLASSES_ROOT -Scope Script | Out-Null }
+    }
+    $stubs = @(
+        '46928bounde\.EclipseManager'
+        'ActiproSoftwareLLC'
+        'Microsoft\.MicrosoftOfficeHub'
+        'Microsoft\.PPIProjection'
+    )
+    $contracts = @('Windows.BackgroundTasks', 'Windows.File', 'Windows.Launch', 'Windows.Protocol', 'Windows.ShareTarget', 'Windows.PreInstalledConfigTask')
+    $root = 'Registry::HKEY_CLASSES_ROOT\Extensions\ContractId'
+
+    foreach ($c in $contracts) {
+        $path = Join-Path $root "$c\PackageId"
+        if (!(Test-Path $path)) { continue }
+        foreach ($child in @(Get-ChildItem -Path $path -ErrorAction SilentlyContinue)) {
+            foreach ($s in $stubs) {
+                if ($child.PSChildName -match $s) {
+                    if ($DryRun) { Write-Log "would delete key: $($child.PSPath)" 'DRY' }
+                    else {
+                        try {
+                            Remove-Item -Path $child.PSPath -Recurse -Force -ErrorAction Stop
+                            Write-Log "deleted key: $($child.PSChildName)" 'OK'
+                        }
+                        catch { Write-Log "key delete failed: $($child.PSChildName)" 'WARN' }
+                    }
+                }
+            }
+        }
+    }
+}
+
+# --------------------------------------------------------------------------
+# Windows 11 privacy / advertising / AI surfaces
+# --------------------------------------------------------------------------
+
+function Invoke-Privacy {
+    Write-Log '--- Privacy and telemetry ---'
+
+    $hklm = 'HKLM:\SOFTWARE\Policies\Microsoft\Windows'
+    $hkcu = 'HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion'
+    $hkcuPol = 'HKCU:\SOFTWARE\Policies\Microsoft\Windows'
+
+    # Advertising ID - Win11 still honours this
+    Set-RegValue "$hkcu\AdvertisingInfo" 'Enabled' 0
+    Set-RegValue "$hklm\AdvertisingInfo" 'Enabled' 0
+
+    # Telemetry. On Pro/Home the floor is "Required/Basic" (1) whatever the
+    # value says; setting 0 only fully applies on Enterprise/Education.
+    # Documented rather than hidden, because the original script implied it worked.
+    Set-RegValue "$hklm\DataCollection" 'AllowTelemetry' 0
+    Set-RegValue "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\DataCollection" 'AllowTelemetry' 0
+    Set-RegValue "$hklm\DataCollection" 'DoNotShowFeedbackNotifications' 1
+    Set-RegValue "$hklm\DataCollection" 'MaxTelemetrySizePct' 0
+
+    # Feedback / Siuf
+    Set-RegValue 'HKCU:\Software\Microsoft\Siuf\Rules' 'NumberOfSIUFInPeriod' 0
+    Set-RegValue 'HKCU:\Software\Microsoft\Siuf\Rules' 'PeriodInNanoSeconds' 0
+
+    # Bing / web results in Start menu search, and search location
+    Set-RegValue "$hkcu\Search" 'BingSearchEnabled' 0
+    Set-RegValue "$hkcu\Search" 'CortanaConsent' 0
+    Set-RegValue "$hklm\Windows Search" 'DisableWebSearch' 1
+    Set-RegValue "$hklm\Windows Search" 'ConnectedSearchUseWeb' 0
+    Set-RegValue "$hklm\Windows Search" 'AllowCortana' 0
+    Set-RegValue "$hklm\Windows Search" 'AllowSearchToUseLocation' 0
+    Set-RegValue "$hklm\Explorer" 'DisableSearchBoxSuggestions' 1
+
+    # Consumer features: stops Windows reinstalling the apps we just removed
+    Set-RegValue "$hklm\CloudContent" 'DisableWindowsConsumerFeatures' 1
+    Set-RegValue "$hklm\CloudContent" 'DisableSoftLanding' 1
+    Set-RegValue "$hklm\CloudContent" 'DisableCloudOptimizedContent' 1
+
+    $cdm = "$hkcu\ContentDeliveryManager"
+    foreach ($v in 'ContentDeliveryAllowed', 'OemPreInstalledAppsEnabled', 'PreInstalledAppsEnabled',
+        'PreInstalledAppsEverEnabled', 'SilentInstalledAppsEnabled', 'SystemPaneSuggestionsEnabled',
+        'SoftLandingEnabled', 'RotatingLockScreenEnabled', 'RotatingLockScreenOverlayEnabled',
+        'SubscribedContent-310093Enabled', 'SubscribedContent-338387Enabled', 'SubscribedContent-338388Enabled',
+        'SubscribedContent-338389Enabled', 'SubscribedContent-338393Enabled', 'SubscribedContent-353694Enabled',
+        'SubscribedContent-353696Enabled', 'SubscribedContent-88000326Enabled') {
+        Set-RegValue $cdm $v 0
+    }
+
+    # Explorer advertising / sync provider notifications
+    Set-RegValue "$hkcu\Explorer\Advanced" 'ShowSyncProviderNotifications' 0
+
+    # Live tiles / push (Win11 tiles are gone but push still feeds toasts)
+    Set-RegValue 'HKCU:\SOFTWARE\Policies\Microsoft\Windows\CurrentVersion\PushNotifications' 'NoTileApplicationNotification' 1
+
+    # Location
+    Set-RegValue 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Sensor\Overrides\{BFA794E4-F964-4FDB-90F6-51056BFE4B44}' 'SensorPermissionState' 0
+    Set-RegValue 'HKLM:\SYSTEM\CurrentControlSet\Services\lfsvc\Service\Configuration' 'Status' 0
+
+    # Recall / AI data analysis (Win11 24H2+ Copilot+ PCs)
+    Set-RegValue "$hklm\WindowsAI" 'DisableAIDataAnalysis' 1
+    Set-RegValue "$hklm\WindowsAI" 'AllowRecallEnablement' 0
+    Set-RegValue "$hkcu\WindowsAI" 'DisableAIDataAnalysis' 1
+
+    # Edge: stop the first-run / shopping nudges (does not uninstall Edge)
+    Set-RegValue 'HKLM:\SOFTWARE\Policies\Microsoft\Edge' 'ShowRecommendationsEnabled' 0
+    Set-RegValue 'HKLM:\SOFTWARE\Policies\Microsoft\Edge' 'PersonalizationReportingEnabled' 0
+    Set-RegValue 'HKLM:\SOFTWARE\Policies\Microsoft\Edge' 'EdgeShoppingAssistantEnabled' 0
+
+    # Store auto-updates of removed apps
+    Set-RegValue 'HKLM:\SOFTWARE\Policies\Microsoft\WindowsStore' 'AutoDownload' 2
+    Set-RegValue 'HKLM:\SOFTWARE\Policies\Microsoft\WindowsStore' 'DisableStoreApps' 0
+
+    if ($DisableTelemetry -or $Action -eq 'Privacy') {
+        Disable-DiagTrack
+        Disable-WAPPush
+        Disable-TelemetryTasks
+    }
+}
+
+function Disable-Copilot {
+    Set-RegValue 'HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer\Advanced' 'ShowCopilotButton' 0
+    Set-RegValue 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\WindowsCopilot' 'TurnOffWindowsCopilot' 1
+    Set-RegValue 'HKCU:\SOFTWARE\Policies\Microsoft\Windows\WindowsCopilot' 'TurnOffWindowsCopilot' 1
+}
+
+function Disable-Widgets {
+    Set-RegValue 'HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer\Advanced' 'TaskbarDa' 0
+    Set-RegValue 'HKLM:\SOFTWARE\Policies\Microsoft\Dsh' 'AllowNewsAndInterests' 0
+    Set-RegValue 'HKCU:\SOFTWARE\Policies\Microsoft\Windows\Explorer' 'AllowNewsAndInterests' 0
+}
+
+function Disable-ChatTaskbar {
+    # Windows 11 22H2 - 23H2 shipped "Chat" as a taskbar entry backed by consumer Teams.
+    Set-RegValue 'HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer\Advanced' 'TaskbarMn' 0
+}
+
+function Disable-StartAds {
+    $adv = 'HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer\Advanced'
+    $cdm = 'HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\ContentDeliveryManager'
+    Set-RegValue $adv 'Start_IrisRecommendations' 0
+    Set-RegValue $adv 'Start_AccountNotifications' 0
+    Set-RegValue 'HKCU:\SOFTWARE\Policies\Microsoft\Windows\Explorer' 'HideRecommendedSection' 1
+    foreach ($v in 'SystemPaneSuggestionsEnabled', 'SoftLandingEnabled', 'SilentInstalledAppsEnabled',
+        'SubscribedContent-310093Enabled', 'SubscribedContent-338388Enabled', 'SubscribedContent-338389Enabled',
+        'SubscribedContent-338393Enabled', 'SubscribedContent-353694Enabled', 'SubscribedContent-353696Enabled') {
+        Set-RegValue $cdm $v 0
+    }
+    Set-RegValue 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\CloudContent' 'DisableWindowsConsumerFeatures' 1
+    Set-RegValue 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\CloudContent' 'DisableSoftLanding' 1
+}
+
+function Disable-BingSearch {
+    Set-RegValue 'HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Search' 'BingSearchEnabled' 0
+    Set-RegValue 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\Windows Search' 'DisableWebSearch' 1
+    Set-RegValue 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\Windows Search' 'ConnectedSearchUseWeb' 0
+    Set-RegValue 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\Explorer' 'DisableSearchBoxSuggestions' 1
+    Set-RegValue 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\Windows Search' 'AllowSearchToUseLocation' 0
+}
+
+function Disable-RecallAI {
+    # Recall / Copilot+ snapshots - Windows 11 24H2 and later
+    Set-RegValue 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\WindowsAI' 'DisableAIDataAnalysis' 1
+    Set-RegValue 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\WindowsAI' 'AllowRecallEnablement' 0
+    Set-RegValue 'HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\WindowsAI' 'DisableAIDataAnalysis' 1
+}
+
+function Invoke-Win11Extras {
+    Write-Log '--- Windows 11 specific extras ---'
+    Disable-Copilot
+    Disable-Widgets
+    Disable-ChatTaskbar
+    Disable-StartAds
+    Disable-BingSearch
+    Disable-RecallAI
+
+    # Taskbar search box: 0 hidden, 1 icon, 2 box, 3 box + label
+    Set-RegValue 'HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Search' 'SearchboxTaskbarMode' 1
+
+    # "Get the latest updates as soon as they are available" nag
+    Set-RegValue 'HKCU:\SOFTWARE\Microsoft\WindowsUpdate\UX\Settings' 'IsContinuousInnovationOptedIn' 0
+    Set-RegValue 'HKLM:\SOFTWARE\Microsoft\WindowsUpdate\UX\Settings' 'IsContinuousInnovationOptedIn' 0
+
+    # Remove the consumer Chat / Copilot / Dev Home packages themselves.
+    $targets = @($script:AppxCache | Where-Object {
+            $_.Name -match '^MicrosoftTeams$|Microsoft\.Windows\.Copilot|Microsoft\.Windows\.Ai\.Copilot\.Provider|Microsoft\.Windows\.DevHome'
+        } | Select-Object -ExpandProperty Name -Unique)
+
+    if ($targets.Count -eq 0) {
+        Write-Log 'no Chat / Copilot / Dev Home packages installed.'
+    }
+    else {
+        foreach ($n in $targets) { Remove-AppxSafely -Name $n -IncludeProvisioned }
+    }
+
+    if ($DryRun) { Write-Log 'would apply the Windows 11 extras above.' 'DRY' }
+    else { Write-Log 'Windows 11 extras applied. Restart Explorer to see taskbar changes.' 'OK' }
+}
+
+function Disable-DiagTrack {
+    Write-Log '--- Diagnostic Tracking Service ---'
+    Set-ServiceState -Name 'DiagTrack' -StartupType Disabled -Stop
+}
+
+function Disable-WAPPush {
+    Write-Log '--- WAP Push / MDM message service ---'
+    if ($KeepMdmService) {
+        Write-Log 'dmwappushservice kept (intune/MDM enrolled device)' 'WARN'
+        return
+    }
+    Set-ServiceState -Name 'dmwappushservice' -StartupType Disabled -Stop
+}
+
+function Set-ServiceState {
+    param(
+        [string]$Name,
+        [ValidateSet('Automatic', 'Manual', 'Disabled')]
+        [string]$StartupType,
+        [switch]$Stop
+    )
+    $svc = Get-Service -Name $Name -ErrorAction SilentlyContinue
+    if (!$svc) { Write-Log "service not present: $Name" 'WARN'; return }
+
+    if ($DryRun) {
+        Write-Log "would set service $Name -> $StartupType (stop: $($Stop.IsPresent))" 'DRY'
+        $script:Stats.Services++
+        return
+    }
+    try {
+        if ($Stop -and $svc.Status -ne 'Stopped') { Stop-Service -Name $Name -Force -ErrorAction SilentlyContinue }
+        Set-Service -Name $Name -StartupType $StartupType -ErrorAction Stop
+        Write-Log "service $Name -> $StartupType" 'OK'
+        $script:Stats.Services++
+    }
+    catch {
+        Write-Log "service $Name change failed - $($_.Exception.Message)" 'ERROR'
+        [void]$script:Stats.Errors.Add("Set-Service $Name :: $($_.Exception.Message)")
+        $script:Stats.Failed++
+    }
+}
+
+function Disable-TelemetryTasks {
+    Write-Log '--- Telemetry scheduled tasks ---'
+    # Disabled by path because newer Win11 builds ship obfuscated task names
+    # (e.g. Application Experience tasks renamed to random strings).
+    $paths = @(
+        '\Microsoft\Windows\Application Experience\'
+        '\Microsoft\Windows\Customer Experience Improvement Program\'
+        '\Microsoft\Windows\Feedback\Siuf\'
+        '\Microsoft\Windows\Autochk\'
+        '\Microsoft\Windows\CloudExperienceHost\'
+        '\Microsoft\Windows\DiskDiagnostic\'
+        '\Microsoft\Windows\Windows Error Reporting\'
+        '\Microsoft\Windows\Windows Media Sharing\'
+        '\Microsoft\Windows\Maintenance\'
+    )
+    if (!$KeepXbox) { $paths += '\Microsoft\XblGameSave\' }
+
+    $all = @(Get-ScheduledTask -ErrorAction SilentlyContinue)
+    foreach ($t in $all) {
+        foreach ($p in $paths) {
+            if ($t.TaskPath -ne $p) { continue }
+            if ($t.State -eq 'Disabled') {
+                Write-Log "already disabled: $($t.TaskName)" 'DRY'
+                break
+            }
+            if ($DryRun) {
+                Write-Log "would disable task: $($t.TaskPath)$($t.TaskName)" 'DRY'
+                $script:Stats.Tasks++
+            }
+            else {
+                try {
+                    Disable-ScheduledTask -TaskPath $t.TaskPath -TaskName $t.TaskName -ErrorAction Stop | Out-Null
+                    Write-Log "task disabled: $($t.TaskPath)$($t.TaskName)" 'OK'
+                    $script:Stats.Tasks++
+                }
+                catch { Write-Log "task disable failed: $($t.TaskName)" 'WARN' }
+            }
+            break
+        }
+    }
+}
+
+function Uninstall-OneDrive {
+    Write-Log '--- OneDrive removal ---'
+    if ($DryRun) {
+        Write-Log 'would back up %USERPROFILE%\OneDrive to Desktop\OneDriveBackupFiles and uninstall OneDrive' 'DRY'
+        return
+    }
+    $src = Join-Path $env:USERPROFILE 'OneDrive'
+    $dest = Join-Path $env:USERPROFILE 'Desktop\OneDriveBackupFiles'
+    if ((Test-Path $src) -and (Get-ChildItem -Path $src -Force -ErrorAction SilentlyContinue)) {
+        if (!(Test-Path $dest)) { New-Item -Path $dest -ItemType Directory -Force | Out-Null }
+        try {
+            Move-Item -Path (Join-Path $src '*') -Destination $dest -Force -ErrorAction Stop
+            Write-Log "moved local OneDrive files to $dest" 'OK'
+        }
+        catch { Write-Log "could not move all OneDrive files - $($_.Exception.Message)" 'WARN' }
+    }
+
+    foreach ($exe in @("$env:SystemRoot\SysWOW64\OneDriveSetup.exe", "$env:SystemRoot\System32\OneDriveSetup.exe")) {
+        if (Test-Path $exe) {
+            try { Start-Process -FilePath $exe -ArgumentList '/uninstall' -Wait -NoNewWindow; Write-Log "ran $exe /uninstall" 'OK' }
+            catch { Write-Log "uninstall failed: $exe" 'WARN' }
+        }
+    }
+
+    # Packaged OneDrive (Win11 24H2+)
+    foreach ($n in @(Get-AppxPackage -AllUsers -ErrorAction SilentlyContinue | Where-Object { $_.Name -match 'Microsoft\.OneDriveSync' } | Select-Object -ExpandProperty Name -Unique)) {
+        Remove-AppxSafely -Name $n
+    }
+
+    Set-RegValue 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\OneDrive' 'DisableFileSyncNGSC' 1
+    try { Remove-Item 'env:OneDrive' -ErrorAction SilentlyContinue } catch { }
+    Write-Log 'OneDrive removed. Explorer restart recommended.' 'OK'
+}
+
+function Set-UnpinStart {
+    Write-Log '--- Unpinning Start menu items ---'
+    $layoutFile = Join-Path $env:SystemRoot 'Win11StartMenuLayout.xml'
+    $layout = @'
+<LayoutModificationTemplate xmlns="http://schemas.microsoft.com/Start/2014/LayoutModification" xmlns:defaultlayout="http://schemas.microsoft.com/Start/2014/FullDefaultLayout" xmlns:start="http://schemas.microsoft.com/Start/2014/StartLayout" Version="1">
+  <LayoutOptions StartTileGroupCellWidth="6" />
+  <DefaultLayoutOverride>
+    <StartLayoutCollection>
+      <defaultlayout:StartLayout GroupCellWidth="6" />
+    </StartLayoutCollection>
+  </DefaultLayoutOverride>
+</LayoutModificationTemplate>
+'@
+    if ($DryRun) {
+        Write-Log 'would apply an empty Start layout via LockedStartLayout, then unlock it' 'DRY'
+        return
+    }
+    try {
+        $layout | Out-File -FilePath $layoutFile -Encoding ASCII -Force
+        foreach ($hive in 'HKLM', 'HKCU') {
+            $key = "${hive}:\SOFTWARE\Policies\Microsoft\Windows\Explorer"
+            if (!(Test-Path $key)) { New-Item -Path $key -Force | Out-Null }
+            New-ItemProperty -Path $key -Name 'LockedStartLayout' -Value 1 -PropertyType DWord -Force | Out-Null
+            New-ItemProperty -Path $key -Name 'StartLayoutFile' -Value $layoutFile -PropertyType String -Force | Out-Null
+        }
+        Stop-Process -Name explorer -Force -ErrorAction SilentlyContinue
+        Start-Sleep -Seconds 5
+        Start-Process explorer.exe
+        Start-Sleep -Seconds 5
+        foreach ($hive in 'HKLM', 'HKCU') {
+            $key = "${hive}:\SOFTWARE\Policies\Microsoft\Windows\Explorer"
+            New-ItemProperty -Path $key -Name 'LockedStartLayout' -Value 0 -PropertyType DWord -Force | Out-Null
+        }
+        Remove-Item $layoutFile -Force -ErrorAction SilentlyContinue
+        Stop-Process -Name explorer -Force -ErrorAction SilentlyContinue
+        Start-Sleep -Seconds 3
+        Start-Process explorer.exe
+        Write-Log 'Start menu pins cleared.' 'OK'
+    }
+    catch {
+        Write-Log "unpin failed - $($_.Exception.Message)" 'WARN'
+    }
+}
+
+function Remove-3DObjects {
+    Write-Log '--- 3D Objects folder ---'
+    foreach ($k in @(
+            'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer\MyComputer\NameSpace\{0DB7E03F-FC29-4DC6-9020-FF41B59E513A}',
+            'HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Explorer\MyComputer\NameSpace\{0DB7E03F-FC29-4DC6-9020-FF41B59E513A}')) {
+        if (!(Test-Path $k)) { continue }
+        if ($DryRun) { Write-Log "would delete $k" 'DRY' }
+        else {
+            try { Remove-Item $k -Recurse -Force -ErrorAction Stop; Write-Log "deleted $k" 'OK' }
+            catch { Write-Log "could not delete $k" 'WARN' }
+        }
+    }
+}
+
+# --------------------------------------------------------------------------
+# Revert
+# --------------------------------------------------------------------------
+
+function Invoke-Revert {
+    Write-Log '--- Reverting registry, service and task changes ---'
+    $adv = 'HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer\Advanced'
+
+    Set-RegValue 'HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\AdvertisingInfo' 'Enabled' 1
+    Set-RegValue 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\DataCollection' 'AllowTelemetry' 3
+    Set-RegValue 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\DataCollection' 'AllowTelemetry' 3
+    Set-RegValue 'HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Search' 'BingSearchEnabled' 1
+    Set-RegValue 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\Windows Search' 'DisableWebSearch' 0
+    Set-RegValue 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\Windows Search' 'ConnectedSearchUseWeb' 1
+    Set-RegValue 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\CloudContent' 'DisableWindowsConsumerFeatures' 0
+    Set-RegValue 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\WindowsCopilot' 'TurnOffWindowsCopilot' 0
+    Set-RegValue "$adv" 'ShowCopilotButton' 1
+    Set-RegValue "$adv" 'TaskbarDa' 1
+    Set-RegValue "$adv" 'TaskbarMn' 1
+    Set-RegValue "$adv" 'Start_IrisRecommendations' 1
+    Set-RegValue 'HKLM:\SOFTWARE\Policies\Microsoft\Dsh' 'AllowNewsAndInterests' 1
+    Set-RegValue 'HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\ContentDeliveryManager' 'SilentInstalledAppsEnabled' 1
+    Set-RegValue 'HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\ContentDeliveryManager' 'SubscribedContent-338388Enabled' 1
+
+    Set-ServiceState -Name 'DiagTrack' -StartupType Automatic
+    if (!$KeepMdmService) { Set-ServiceState -Name 'dmwappushservice' -StartupType Manual }
+
+    if (!$DryRun) {
+        foreach ($p in @('\Microsoft\Windows\Application Experience\', '\Microsoft\Windows\Customer Experience Improvement Program\', '\Microsoft\Windows\Feedback\Siuf\')) {
+            foreach ($t in @(Get-ScheduledTask -TaskPath $p -ErrorAction SilentlyContinue)) {
+                try { Enable-ScheduledTask -TaskPath $p -TaskName $t.TaskName -ErrorAction Stop | Out-Null } catch { }
+            }
+        }
+        Write-Log 're-registering Appx packages still present on disk...'
+        foreach ($pkg in @(Get-AppxPackage -AllUsers -ErrorAction SilentlyContinue)) {
+            if ([string]::IsNullOrEmpty($pkg.InstallLocation)) { continue }
+            $manifest = Join-Path $pkg.InstallLocation 'AppXManifest.xml'
+            if (!(Test-Path $manifest)) { continue }
+            try { Add-AppxPackage -DisableDevelopmentMode -Register $manifest -ErrorAction Stop } catch { }
+        }
+        Write-Log 'Revert finished. Packages that were fully removed must be reinstalled from the Store.' 'OK'
+    }
+    else {
+        Write-Log 'would re-enable tasks, services and re-register Appx packages' 'DRY'
+    }
+}
+
+# --------------------------------------------------------------------------
+# Inventory
+# --------------------------------------------------------------------------
+
+function Show-Inventory {
+    $rows = foreach ($p in @(Get-AppxPackage -AllUsers -ErrorAction SilentlyContinue | Sort-Object Name)) {
+        [pscustomobject]@{
+            Name         = $p.Name
+            Version      = $p.Version
+            NonRemovable = $p.NonRemovable
+            IsFramework  = $p.IsFramework
+            Protected    = (Test-AppxProtected -Name $p.Name)
+            Publisher    = $p.Publisher
+            InstallPath  = $p.InstallLocation
+        }
+    }
+    $out = Join-Path ([Environment]::GetFolderPath('Desktop')) ("Win11-Appx-Inventory-{0}.csv" -f (Get-Date).ToString('yyyyMMdd-HHmm'))
+    $rows | Sort-Object Protected, Name | Export-Csv -Path $out -NoTypeInformation -Encoding UTF8
+    Write-Log "inventory written: $out" 'OK'
+    Write-Host ("{0} packages, {1} protected" -f @($rows).Count, @($rows | Where-Object Protected).Count)
+}
+
+# --------------------------------------------------------------------------
+# Restore point
+# --------------------------------------------------------------------------
+
+function New-DebloatRestorePoint {
+    if ($NoRestorePoint -or $DryRun) { return }
+    Write-Log '--- Creating a System Restore checkpoint ---'
+    try {
+        Enable-ComputerRestore -Drive "$env:SystemDrive\" -ErrorAction SilentlyContinue
+        Checkpoint-Computer -Description 'Win11Debloater' -RestorePointType 'MODIFY_SETTINGS' -ErrorAction Stop
+        Write-Log 'restore point created' 'OK'
+    }
+    catch {
+        Write-Log "restore point skipped - $($_.Exception.Message)" 'WARN'
+        Write-Log 'not fatal: System Restore may be disabled or a checkpoint was made in the last 24h.' 'WARN'
+    }
+}
+
+# --------------------------------------------------------------------------
+# Summary
+# --------------------------------------------------------------------------
+
+function Show-Summary {
+    Write-Host ''
+    Write-Host '================ SUMMARY ================' -ForegroundColor Cyan
+    Write-Host ("  removed / queued : {0}" -f $script:Stats.Removed)
+    Write-Host ("  skipped          : {0}" -f $script:Stats.Skipped)
+    Write-Host ("  failed           : {0}" -f $script:Stats.Failed)
+    Write-Host ("  settings written : {0}" -f $script:Stats.Settings)
+    Write-Host ("  tasks disabled   : {0}" -f $script:Stats.Tasks)
+    Write-Host ("  services changed : {0}" -f $script:Stats.Services)
+    if ($script:Stats.Errors.Count -gt 0) {
+        Write-Host '  errors:' -ForegroundColor Yellow
+        $script:Stats.Errors | Select-Object -First 20 | ForEach-Object { Write-Host "    - $_" -ForegroundColor Yellow }
+    }
+    Write-Host '=========================================' -ForegroundColor Cyan
+    if ($DryRun) { Write-Host '  DRY RUN - nothing was changed.' -ForegroundColor Cyan }
+    Write-Host ''
+}
+
+# --------------------------------------------------------------------------
+# Menu
+# --------------------------------------------------------------------------
+
+function Show-Menu {
+    $banner = @'
+  __      __.__       ____ ____       __         .___           __
+ /  \    /  \__| ____/  _ \___ \ ____ |  | _____  |   | _____  _|  | ______  ___
+ \   \/\/   /  |/    \  / \  \ \  _ \|  | \__  \ |   |/     \  |/  /  _ \/  _ \
+  \        /|  |   |  \  \_/  /  __ \  |__/ __ \_|   |  Y Y  \ |    (  <_> )  __/
+   \__/\  / |__|___|  /\____/|____  /____(____  /|___|__|_|  /_|__| \____/ \___>
+        \/          \/            \/          \/          \/
+        Windows 11 adaptation - interactive mode
+'@
+    Write-Host $banner -ForegroundColor Cyan
+    Write-Host ' 1  Remove bloatware (curated Windows 11 list)'
+    Write-Host ' 2  Remove ALL non-protected apps (aggressive, asks first)'
+    Write-Host ' 3  Privacy and telemetry hardening'
+    Write-Host ' 4  Windows 11 extras (Copilot, widgets, Chat, Start ads)'
+    Write-Host ' 5  Uninstall OneDrive'
+    Write-Host ' 6  Clear Start menu pins'
+    Write-Host ' 7  Remove 3D Objects folder'
+    Write-Host ' 8  Export app inventory to CSV'
+    Write-Host ' 9  Revert changes'
+    Write-Host ' 0  Exit'
+    Write-Host ''
+}
+
+
+# Switches the caller passed, so elevation can re-apply them.
+$script:BoundArgs = $PSBoundParameters
+
+# --------------------------------------------------------------------------
+# Main
+# --------------------------------------------------------------------------
+
+Initialize-Log
+
+$info = Get-Win11Info
+$productLabel = $info.ProductName
+if ($info.IsWindows11) { $productLabel = $productLabel -replace 'Windows 10', 'Windows 11' }  # registry string is stale on Win11
+Write-Log ("Windows: {0} {1} build {2}.{3}" -f $productLabel, $info.DisplayVer, $info.Build, $info.UBR)
+if (!$info.IsWindows11) {
+    Write-Log 'This build is NOT Windows 11 (build < 22000). The package lists are tuned for Windows 11 and may behave oddly on Windows 10.' 'WARN'
+}
+
+if (![string]::IsNullOrEmpty($EmitElevationLauncher)) {
+    try {
+        New-ElevationLauncher -Path $EmitElevationLauncher | Out-Null
+        Write-Log "elevation launcher written: $EmitElevationLauncher" 'OK'
+    }
+    catch {
+        Write-Log "could not write launcher: $($_.Exception.Message)" 'ERROR'
+    }
+    Stop-Log
+    exit
+}
+
+if (!(Test-Admin)) {
+    if ($DryRun) {
+        Write-Log 'Not elevated - dry run continues, but Appx state will be read-only.' 'WARN'
+    }
+    else {
+        Stop-Log
+        if (Invoke-SelfElevate) { }
+        exit
+    }
+}
+Write-Log 'Running elevated.' 'OK'
+
+if ($DryRun) { Write-Log 'DRY RUN: no changes will be made.' 'DRY' }
+
+$script:ProtectedPatterns = Get-ProtectedAppxPatterns
+$script:ProtectedNames = Get-ProtectedPackageName
+Write-Log ("loaded {0} protected package name(s) and {1} protected pattern(s)" -f @($script:ProtectedNames).Count, @($script:ProtectedPatterns).Count)
+
+# Mount HKCR once - needed for leftover key cleanup and reads
+if (!(Get-PSDrive -Name HKCR -ErrorAction SilentlyContinue)) {
+    New-PSDrive -Name HKCR -PSProvider Registry -Root HKEY_CLASSES_ROOT -Scope Global -ErrorAction SilentlyContinue | Out-Null
+}
+
+switch ($Action) {
+    'Inventory' { Show-Inventory; Show-Summary; Stop-Log; exit }
+
+    'DebloatBlacklist' {
+        New-DebloatRestorePoint
+        Invoke-DebloatBlacklist
+        Remove-LeftoverKeys
+    }
+
+    'DebloatAll' {
+        New-DebloatRestorePoint
+        Invoke-DebloatAll
+        Remove-LeftoverKeys
+        if ($DisableTelemetry) { Disable-TelemetryTasks }
+    }
+
+    'Privacy' {
+        New-DebloatRestorePoint
+        Invoke-Privacy
+    }
+
+    'Extras' {
+        New-DebloatRestorePoint
+        if ($DisableCopilot) { Disable-Copilot }
+        if ($DisableWidgets) { Disable-Widgets }
+        if ($DisableChat) { Disable-ChatTaskbar }
+        if ($DisableStartAds) { Disable-StartAds }
+        if ($DisableBingSearch) { Disable-BingSearch }
+        Invoke-Win11Extras
+    }
+
+    'Revert' {
+        Invoke-Revert
+    }
+
+    'Menu' {
+        Show-Menu
+        $choice = Read-Host 'Select an option'
+        switch ($choice) {
+            '1' { New-DebloatRestorePoint; Invoke-DebloatBlacklist; Remove-LeftoverKeys }
+            '2' {
+                $confirm = Read-Host 'This removes every Appx package that is not on the protected or keep list. Type YES to continue'
+                if ($confirm -eq 'YES') { $Aggressive = [switch]$true; New-DebloatRestorePoint; Invoke-DebloatAll }
+                else { Write-Log 'aggressive removal cancelled' 'WARN' }
+            }
+            '3' { New-DebloatRestorePoint; Invoke-Privacy }
+            '4' { New-DebloatRestorePoint; Invoke-Win11Extras }
+            '5' { New-DebloatRestorePoint; Uninstall-OneDrive }
+            '6' { Set-UnpinStart }
+            '7' { Remove-3DObjects }
+            '8' { Show-Inventory }
+            '9' { Invoke-Revert }
+            '0' { Write-Log 'exiting' }
+            default { Write-Log "unknown option: $choice" 'WARN' }
+        }
+    }
+    default { }
+}
+
+Show-Summary
+
+if (!$NoRebootPrompt -and !$DryRun -and $Action -ne 'Inventory') {
+    $ans = Read-Host 'Reboot now to finish applying changes? (y/N)'
+    if ($ans -match '^(y|Y)') {
+        Write-Log 'rebooting'
+        Stop-Log
+        Restart-Computer -Force
+    }
+}
+
+Stop-Log

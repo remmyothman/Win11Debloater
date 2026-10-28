@@ -41,6 +41,38 @@ Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass
 
 Or double-click `Win11DebloaterGUI.ps1` for the window version.
 
+## One-liner (single-file build)
+
+`dist\Win11Debloater.standalone.ps1` is the console script with the library
+inlined, so it survives being piped into memory:
+
+```powershell
+irm https://raw.githubusercontent.com/remmyothman/Win11Debloater/master/dist/Win11Debloater.standalone.ps1 | iex
+```
+
+That drops you in the interactive menu. Because a piped script has no file path
+to relaunch, elevation works by re-fetching the same URL in an elevated window -
+you get one UAC prompt.
+
+Preview without changing anything (this form passes switches):
+
+```powershell
+$u = 'https://raw.githubusercontent.com/remmyothman/Win11Debloater/master/dist/Win11Debloater.standalone.ps1'
+& ([scriptblock]::Create((irm $u))) -Action DebloatBlacklist -DryRun
+```
+
+Limits of the piped build: console only (no GUI), and `custom-lists.ps1` is not
+read because there is no script folder to look in. For those, use the cloned
+repo.
+
+It is a generated file - never edit it. After changing `lib\Win11Debloat.Core.ps1`
+or `Win11Debloater.ps1`, rebuild and commit both:
+
+```powershell
+.\tools\Build-Standalone.ps1          # regenerate dist\
+.\tools\Build-Standalone.ps1 -Verify  # exits 1 if dist\ is stale
+```
+
 ## Actions
 
 | Action | What it does |
@@ -107,11 +139,13 @@ removable by hand, never by `DebloatAll`.
 ## Files
 
 ```
-Win11Debloater.ps1           console / interactive
-Win11DebloaterGUI.ps1        WinForms front-end
-lib/Win11Debloat.Core.ps1    shared functions (both entry points use this)
-WINDOWS11-MIGRATION.md       change log and verification results
-Windows10-legacy/            the original Windows 10 scripts, untouched
+Win11Debloater.ps1                          console / interactive
+Win11DebloaterGUI.ps1                       WinForms front-end
+lib/Win11Debloat.Core.ps1                   shared functions (both entry points)
+dist/Win11Debloater.standalone.ps1          generated single-file build for irm | iex
+tools/Build-Standalone.ps1                  builds and verifies dist/
+WINDOWS11-MIGRATION.md                      change log and verification results
+Windows10-legacy/                           the original Windows 10 scripts, untouched
 ```
 
 ## Before you run it

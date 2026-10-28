@@ -105,6 +105,9 @@ On Windows 11 Pro 26H2, build 26300.9457, PowerShell 5.1:
 | Function reference audit | 0 undefined calls (the original had 2) |
 | GUI `-SelfTest` | form builds, 9 top-level / 17 grouped controls |
 | GUI launched at 125% DPI | all 4 groups, 17 buttons, log and status line render without clipping |
+| `dist/` built by `tools/Build-Standalone.ps1` | 1307 lines, parses clean, `-Verify` reports up to date |
+| Standalone run in memory (`& ([scriptblock]::Create($src))`) | same counters as the file version: 30 / 1 / 0 |
+| Elevation launcher for the piped build | generated and parses, re-fetches the raw URL with the caller's switches |
 
 Nothing was actually removed from the test machine - every removal path was
 exercised in `-DryRun` only.
